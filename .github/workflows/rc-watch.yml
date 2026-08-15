@@ -1,0 +1,238 @@
+name: dotnet-rc-watch
+
+# T-055 layer 2 + 3.
+#   layer 2: poll dotnet/core releases every 15 min, urgent push on v11.0.0-rc*
+#   layer 3: daily low-priority heartbeat, so a broken watcher cannot look like a quiet week.
+#
+# The ntfy topic is the only secret. Never echo it; Actions masks registered secrets,
+# and nothing here runs under `set -x`.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # poll
+    - cron: '23 7 * * *'     # heartbeat (09:23 Europe/Paris)
+  workflow_dispatch:
+    inputs:
+      pattern:
+        description: 'Tag regex to match. Drill with ^v11\.0\.0-preview\.7$'
+        required: false
+        default: '^v11\.0\.0-rc'
+      heartbeat:
+        description: 'Send the heartbeat ping too'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write   # the run commits state/rc-seen.json on first detection
+
+concurrency:
+  group: rc-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      GH_TOKEN: ${{ github.token }}
+      # dispatch overrides the pattern; every other trigger uses the real one
+      PATTERN: ${{ github.event.inputs.pattern || '^v11\.0\.0-rc' }}
+      REPEAT_URGENT_SECONDS: '10800'   # keep shouting for 3h after first detection
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to run blind
+        run: |
+          set -euo pipefail
+          if [ -z "${NTFY_TOPIC:-}" ]; then
+            echo "::error::NTFY_TOPIC secret is not set - this watcher cannot notify anyone."
+            exit 1
+          fi
+
+      - name: Poll dotnet/core releases
+        id: poll
+        run: |
+          set -euo pipefail
+          # authenticated: 1000 req/hr/repo. unauthenticated would be 60/hr shared
+          # across all GitHub runner IPs, which */15 would not survive.
+          curl -sS -f \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/dotnet/core/releases?per_page=30" > releases.json
+
+          count=$(jq 'length' releases.json)
+          echo "fetched ${count} releases"
+          if [ "$count" -lt 1 ]; then
+            echo "::error::releases API returned an empty list - treating as a fault, not as 'no RC'."
+            exit 1
+          fi
+
+          # drafts are invisible to the public, so they do not count as published.
+          # prereleases DO count: an RC is flagged prerelease=true, same as a preview.
+          jq -r --arg re "$PATTERN" '
+            [ .[]
+              | select(.draft == false)
+              | select(.tag_name | test($re))
+            ] | sort_by(.published_at) | reverse | .[0] // empty
+          ' releases.json > match.json
+
+          if [ -s match.json ]; then
+            {
+              echo "matched=true"
+              echo "tag=$(jq -r .tag_name match.json)"
+              echo "title=$(jq -r .name match.json)"
+              echo "url=$(jq -r .html_url match.json)"
+              echo "published=$(jq -r .published_at match.json)"
+            } >> "$GITHUB_OUTPUT"
+            echo "MATCH: $(jq -r .tag_name match.json)"
+          else
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+            echo "no tag matching ${PATTERN}"
+          fi
+
+      - name: Decide whether to shout
+        id: decide
+        env:
+          MATCHED: ${{ steps.poll.outputs.matched }}
+          TAG: ${{ steps.poll.outputs.tag }}
+        run: |
+          set -euo pipefail
+          matched="$MATCHED"
+          tag="$TAG"
+          now=$(date -u +%s)
+
+          send_urgent=false
+          first_time=false
+
+          if [ "$matched" = "true" ]; then
+            seen_tag=""
+            seen_at=0
+            if [ -f state/rc-seen.json ]; then
+              seen_tag=$(jq -r '.tag // ""' state/rc-seen.json)
+              seen_at=$(jq -r '.first_seen_epoch // 0' state/rc-seen.json)
+            fi
+
+            if [ "$seen_tag" != "$tag" ]; then
+              send_urgent=true
+              first_time=true
+              seen_at=$now
+            else
+              age=$(( now - seen_at ))
+              if [ "$age" -lt "$REPEAT_URGENT_SECONDS" ]; then
+                # re-shout for a while: one missed push must not lose the week
+                send_urgent=true
+                echo "repeat urgent, ${age}s since first detection"
+              else
+                echo "already alerted ${age}s ago - heartbeat carries it from here"
+              fi
+            fi
+            echo "seen_at=${seen_at}" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "send_urgent=${send_urgent}" >> "$GITHUB_OUTPUT"
+          echo "first_time=${first_time}" >> "$GITHUB_OUTPUT"
+
+      - name: Push urgent alert
+        if: steps.decide.outputs.send_urgent == 'true'
+        env:
+          TAG: ${{ steps.poll.outputs.tag }}
+          URL: ${{ steps.poll.outputs.url }}
+          PUB: ${{ steps.poll.outputs.published }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"; url="$URL"; pub="$PUB"
+
+          body=$(printf '%s\n' \
+            ".NET 11 RC published: ${tag}" \
+            "published ${pub}" \
+            "" \
+            "Submit the httplogging report:" \
+            "  path   E:\\httplogging" \
+            "  report l-d43da6")
+
+          resp=$(curl -sS -f \
+            -H "Title: RC IS LIVE - ${tag}" \
+            -H "Priority: urgent" \
+            -H "Tags: rotating_light" \
+            -H "Click: ${url}" \
+            -d "${body}" \
+            "https://ntfy.sh/${NTFY_TOPIC}")
+
+          # a 200 from curl is not proof the topic accepted it. ntfy echoes the
+          # stored message; no id means nothing was stored.
+          id=$(printf '%s' "$resp" | jq -r '.id // empty')
+          if [ -z "$id" ]; then
+            echo "::error::ntfy returned no message id - the push was NOT stored."
+            exit 1
+          fi
+          echo "published to ntfy, message id ${id}"
+          echo "NTFY_ID=${id}" >> "$GITHUB_ENV"
+
+      - name: Read the alert back off the topic
+        if: steps.decide.outputs.send_urgent == 'true'
+        run: |
+          set -euo pipefail
+          # the only check that distinguishes "ntfy accepted it" from
+          # "it is actually on the topic Kevin's phone subscribes to".
+          sleep 3
+          found=$(curl -sS -f "https://ntfy.sh/${NTFY_TOPIC}/json?poll=1&since=10m" \
+            | jq -r --arg id "${NTFY_ID}" 'select(.id == $id) | .id' | head -n1)
+          if [ -z "$found" ]; then
+            echo "::error::message ${NTFY_ID} is not on the topic - the alert did not land."
+            exit 1
+          fi
+          echo "readback OK: ${found} is on the topic"
+
+      - name: Record first detection
+        if: steps.decide.outputs.first_time == 'true'
+        env:
+          TAG: ${{ steps.poll.outputs.tag }}
+          URL: ${{ steps.poll.outputs.url }}
+          TS: ${{ steps.decide.outputs.seen_at }}
+        run: |
+          set -euo pipefail
+          mkdir -p state
+          jq -n --arg tag "$TAG" --arg url "$URL" --argjson ts "$TS" \
+            '{tag: $tag, url: $url, first_seen_epoch: $ts}' > state/rc-seen.json
+          git config user.name  "rc-watch"
+          git config user.email "rc-watch@users.noreply.github.com"
+          git add state/rc-seen.json
+          git commit -m "rc-watch: first detection of ${TAG}"
+          git push
+
+      - name: Heartbeat
+        if: github.event.schedule == '23 7 * * *' || github.event.inputs.heartbeat == 'true'
+        env:
+          MATCHED: ${{ steps.poll.outputs.matched }}
+          TAG: ${{ steps.poll.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$MATCHED" = "true" ]; then
+            msg="RC IS LIVE (${TAG}) - already alerted. Watcher healthy."
+          else
+            msg="Still watching dotnet/core for v11.0.0-rc*. No RC yet. Watcher healthy."
+          fi
+          curl -sS -f \
+            -H "Title: rc-watch heartbeat" \
+            -H "Priority: min" \
+            -H "Tags: eyes" \
+            -d "${msg}" \
+            "https://ntfy.sh/${NTFY_TOPIC}" > /dev/null
+          echo "heartbeat sent"
+
+      - name: Report own failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          # a silent broken watcher is the exact failure this ticket exists to prevent.
+          [ -n "${NTFY_TOPIC:-}" ] || exit 0
+          curl -sS \
+            -H "Title: rc-watch FAULT" \
+            -H "Priority: high" \
+            -H "Tags: warning" \
+            -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -d "The RC watcher run failed. It is NOT watching. Check the Actions log." \
+            "https://ntfy.sh/${NTFY_TOPIC}" > /dev/null || true
