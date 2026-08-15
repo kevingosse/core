@@ -1,11 +1,16 @@
 name: dotnet-rc-watch
 
-# T-055 layer 2 + 3.
-#   layer 2: poll dotnet/core releases every 15 min, urgent push on v11.0.0-rc*
-#   layer 3: daily low-priority heartbeat, so a broken watcher cannot look like a quiet week.
+# T-055 layers 2 + 3.
 #
-# The ntfy topic is the only secret. Never echo it; Actions masks registered secrets,
-# and nothing here runs under `set -x`.
+#   TIER 1  urgent (prio 5)  dotnet/core publishes a v11.0.0-rc* release   -> GOSIGNAL, submit
+#   TIER 2  high   (prio 4)  a release/11.0[-rc*] BRANCH appears in aspnetcore -> early warning ONLY
+#   TIER 3  min    (prio 1)  daily heartbeat, so a dead watcher cannot look like a quiet week
+#   TIER 0  high   (prio 4)  the run itself failed -> the watcher is not watching
+#
+# Per T-042: tags and branches PREDICT, only a published dotnet/core release AUTHORISES.
+# Tier 2 must never read as "RC IS LIVE".
+#
+# The ntfy topic is the only secret. Nothing here runs under `set -x`.
 
 on:
   schedule:
@@ -14,9 +19,13 @@ on:
   workflow_dispatch:
     inputs:
       pattern:
-        description: 'Tag regex to match. Drill with ^v11\.0\.0-preview\.7$'
+        description: 'Release-tag regex. Drill with ^v11\.0\.0-preview\.7$'
         required: false
-        default: '^v11\.0\.0-rc'
+        default: ''
+      branch_pattern:
+        description: 'Branch-ref regex. Drill with ^refs/heads/release/11\.0-preview7$'
+        required: false
+        default: ''
       heartbeat:
         description: 'Send the heartbeat ping too'
         type: boolean
@@ -24,11 +33,18 @@ on:
         default: false
 
 permissions:
-  contents: write   # the run commits state/rc-seen.json on first detection
+  contents: write   # the run commits state/*.json on first sighting
 
 concurrency:
   group: rc-watch
   cancel-in-progress: false
+
+env:
+  # The shipped constants. The self-test below asserts on THESE, never on a
+  # dispatch override, so a drill can never mask a broken production matcher.
+  PROD_TAG_RE: '^v11\.0\.0-rc'
+  PROD_BRANCH_RE: '^refs/heads/release/11\.0(\.1xx)?(-rc.*)?$'
+  BRANCH_REPOS: 'dotnet/aspnetcore'   # space-separated; add dotnet/runtime here if wanted
 
 jobs:
   watch:
@@ -36,8 +52,8 @@ jobs:
     env:
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       GH_TOKEN: ${{ github.token }}
-      # dispatch overrides the pattern; every other trigger uses the real one
-      PATTERN: ${{ github.event.inputs.pattern || '^v11\.0\.0-rc' }}
+      TAG_RE: ${{ github.event.inputs.pattern || '^v11\.0\.0-rc' }}
+      BRANCH_RE: ${{ github.event.inputs.branch_pattern || '^refs/heads/release/11\.0(\.1xx)?(-rc.*)?$' }}
       REPEAT_URGENT_SECONDS: '10800'   # keep shouting for 3h after first detection
 
     steps:
@@ -50,13 +66,53 @@ jobs:
             echo "::error::NTFY_TOPIC secret is not set - this watcher cannot notify anyone."
             exit 1
           fi
+          mkdir -p state
 
+      # ------------------------------------------------------------------
+      # Self-test. Vector table lifted from T-042 2026-08-10, which records a
+      # real false-positive: an unanchored rc[.-]?1 grep fired permanently off
+      # dotnet 10's release/10.0-rc1. Both directions, every run.
+      # ------------------------------------------------------------------
+      - name: Self-test the matchers
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {  # check <regex> <must_match:0|1> <subject>
+            if printf '%s' "$3" | grep -Eq "$1"; then hit=1; else hit=0; fi
+            if [ "$hit" != "$2" ]; then
+              echo "::error::matcher FAIL: '$3' expected match=$2 got $hit"
+              fail=1
+            fi
+          }
+
+          # tier 1 - release tags
+          for s in 'v11.0.0-rc.1' 'v11.0.0-rc.2' 'v11.0.0-rc1'; do check "$PROD_TAG_RE" 1 "$s"; done
+          for s in 'v11.0.0-preview.7' 'v11.0.0-preview.6' 'v10.0.11' 'v10.0.0-rc.1' 'v11.0.100-preview.6.26359.118'; do
+            check "$PROD_TAG_RE" 0 "$s"; done
+
+          # tier 2 - branches
+          for s in 'refs/heads/release/11.0' 'refs/heads/release/11.0-rc1' 'refs/heads/release/11.0-rc2' \
+                   'refs/heads/release/11.0.1xx' 'refs/heads/release/11.0.1xx-rc1'; do
+            check "$PROD_BRANCH_RE" 1 "$s"; done
+          # the .NET 10 RC branches are the control that proves version scoping does
+          # the work, not the word "rc". The backport case is the substring trap.
+          for s in 'refs/heads/release/11.0-preview7' 'refs/heads/release/11.0.1xx-preview7' \
+                   'refs/heads/release/10.0-rc1' 'refs/heads/release/10.0-rc2' 'refs/heads/release/10.0' \
+                   'refs/heads/backport/pr-63379-to-release/11.0-rc1' 'refs/heads/main'; do
+            check "$PROD_BRANCH_RE" 0 "$s"; done
+
+          [ "$fail" = "0" ] || { echo "::error::matcher self-test failed - refusing to run."; exit 1; }
+          echo "matcher self-test OK (both directions)"
+
+      # ------------------------------------------------------------------
+      # TIER 1 - published releases on dotnet/core
+      # ------------------------------------------------------------------
       - name: Poll dotnet/core releases
         id: poll
         run: |
           set -euo pipefail
-          # authenticated: 1000 req/hr/repo. unauthenticated would be 60/hr shared
-          # across all GitHub runner IPs, which */15 would not survive.
+          # authenticated: 1000 req/hr/repo. unauthenticated is 60/hr shared across
+          # all GitHub runner IPs, which */15 would not survive.
           curl -sS -f \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
@@ -66,31 +122,29 @@ jobs:
           count=$(jq 'length' releases.json)
           echo "fetched ${count} releases"
           if [ "$count" -lt 1 ]; then
-            echo "::error::releases API returned an empty list - treating as a fault, not as 'no RC'."
+            echo "::error::releases API returned an empty list - a fault, not 'no RC'."
             exit 1
           fi
 
-          # drafts are invisible to the public, so they do not count as published.
-          # prereleases DO count: an RC is flagged prerelease=true, same as a preview.
-          jq -r --arg re "$PATTERN" '
-            [ .[]
-              | select(.draft == false)
-              | select(.tag_name | test($re))
-            ] | sort_by(.published_at) | reverse | .[0] // empty
+          # drafts are invisible publicly so they are not published. prereleases DO
+          # count: an RC carries prerelease=true exactly like a preview does, so
+          # filtering on prerelease==false would make this permanently silent.
+          jq -r --arg re "$TAG_RE" '
+            [ .[] | select(.draft == false) | select(.tag_name | test($re)) ]
+            | sort_by(.published_at) | reverse | .[0] // empty
           ' releases.json > match.json
 
           if [ -s match.json ]; then
             {
               echo "matched=true"
               echo "tag=$(jq -r .tag_name match.json)"
-              echo "title=$(jq -r .name match.json)"
               echo "url=$(jq -r .html_url match.json)"
               echo "published=$(jq -r .published_at match.json)"
             } >> "$GITHUB_OUTPUT"
             echo "MATCH: $(jq -r .tag_name match.json)"
           else
             echo "matched=false" >> "$GITHUB_OUTPUT"
-            echo "no tag matching ${PATTERN}"
+            echo "no release tag matching ${TAG_RE}"
           fi
 
       - name: Decide whether to shout
@@ -100,29 +154,21 @@ jobs:
           TAG: ${{ steps.poll.outputs.tag }}
         run: |
           set -euo pipefail
-          matched="$MATCHED"
-          tag="$TAG"
           now=$(date -u +%s)
-
           send_urgent=false
           first_time=false
 
-          if [ "$matched" = "true" ]; then
-            seen_tag=""
-            seen_at=0
+          if [ "$MATCHED" = "true" ]; then
+            seen_tag=""; seen_at=0
             if [ -f state/rc-seen.json ]; then
               seen_tag=$(jq -r '.tag // ""' state/rc-seen.json)
               seen_at=$(jq -r '.first_seen_epoch // 0' state/rc-seen.json)
             fi
-
-            if [ "$seen_tag" != "$tag" ]; then
-              send_urgent=true
-              first_time=true
-              seen_at=$now
+            if [ "$seen_tag" != "$TAG" ]; then
+              send_urgent=true; first_time=true; seen_at=$now
             else
               age=$(( now - seen_at ))
               if [ "$age" -lt "$REPEAT_URGENT_SECONDS" ]; then
-                # re-shout for a while: one missed push must not lose the week
                 send_urgent=true
                 echo "repeat urgent, ${age}s since first detection"
               else
@@ -131,11 +177,10 @@ jobs:
             fi
             echo "seen_at=${seen_at}" >> "$GITHUB_OUTPUT"
           fi
-
           echo "send_urgent=${send_urgent}" >> "$GITHUB_OUTPUT"
           echo "first_time=${first_time}" >> "$GITHUB_OUTPUT"
 
-      - name: Push urgent alert
+      - name: Push urgent alert (GOSIGNAL)
         if: steps.decide.outputs.send_urgent == 'true'
         env:
           TAG: ${{ steps.poll.outputs.tag }}
@@ -143,31 +188,23 @@ jobs:
           PUB: ${{ steps.poll.outputs.published }}
         run: |
           set -euo pipefail
-          tag="$TAG"; url="$URL"; pub="$PUB"
-
           body=$(printf '%s\n' \
-            ".NET 11 RC published: ${tag}" \
-            "published ${pub}" \
+            ".NET 11 RC published: ${TAG}" \
+            "published ${PUB}" \
             "" \
-            "Submit the httplogging report:" \
+            "This AUTHORISES submission." \
             "  path   E:\\httplogging" \
             "  report l-d43da6")
 
           resp=$(curl -sS -f \
-            -H "Title: RC IS LIVE - ${tag}" \
-            -H "Priority: urgent" \
-            -H "Tags: rotating_light" \
-            -H "Click: ${url}" \
-            -d "${body}" \
-            "https://ntfy.sh/${NTFY_TOPIC}")
+            -H "Title: RC IS LIVE - ${TAG}" \
+            -H "Priority: urgent" -H "Tags: rotating_light" -H "Click: ${URL}" \
+            -d "${body}" "https://ntfy.sh/${NTFY_TOPIC}")
 
-          # a 200 from curl is not proof the topic accepted it. ntfy echoes the
+          # a 200 from curl is not proof the topic stored it. ntfy echoes the
           # stored message; no id means nothing was stored.
           id=$(printf '%s' "$resp" | jq -r '.id // empty')
-          if [ -z "$id" ]; then
-            echo "::error::ntfy returned no message id - the push was NOT stored."
-            exit 1
-          fi
+          [ -n "$id" ] || { echo "::error::ntfy returned no message id - push NOT stored."; exit 1; }
           echo "published to ntfy, message id ${id}"
           echo "NTFY_ID=${id}" >> "$GITHUB_ENV"
 
@@ -175,15 +212,12 @@ jobs:
         if: steps.decide.outputs.send_urgent == 'true'
         run: |
           set -euo pipefail
-          # the only check that distinguishes "ntfy accepted it" from
-          # "it is actually on the topic Kevin's phone subscribes to".
+          # the only check separating "ntfy accepted it" from "it is on the topic
+          # Kevin's phone actually subscribes to".
           sleep 3
           found=$(curl -sS -f "https://ntfy.sh/${NTFY_TOPIC}/json?poll=1&since=10m" \
             | jq -r --arg id "${NTFY_ID}" 'select(.id == $id) | .id' | head -n1)
-          if [ -z "$found" ]; then
-            echo "::error::message ${NTFY_ID} is not on the topic - the alert did not land."
-            exit 1
-          fi
+          [ -n "$found" ] || { echo "::error::message ${NTFY_ID} is not on the topic."; exit 1; }
           echo "readback OK: ${found} is on the topic"
 
       - name: Record first detection
@@ -194,15 +228,114 @@ jobs:
           TS: ${{ steps.decide.outputs.seen_at }}
         run: |
           set -euo pipefail
-          mkdir -p state
           jq -n --arg tag "$TAG" --arg url "$URL" --argjson ts "$TS" \
             '{tag: $tag, url: $url, first_seen_epoch: $ts}' > state/rc-seen.json
+
+      # ------------------------------------------------------------------
+      # TIER 2 - release branches (early warning, NOT authorisation)
+      # ------------------------------------------------------------------
+      - name: Poll release branches
+        id: branches
+        run: |
+          set -euo pipefail
+          # matching-refs is prefix-anchored server-side, so no pagination and no
+          # chance of the ref we want sitting on page 5 of an alphabetical list.
+          : > refs.txt
+          for repo in $BRANCH_REPOS; do
+            curl -sS -f \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${repo}/git/matching-refs/heads/release/11" \
+              | jq -r --arg r "$repo" '.[] | "\($r) \(.ref)"' >> refs.txt
+          done
+          echo "release/11* refs seen: $(wc -l < refs.txt)"
+
+          # CONTROL: the same query must find dotnet 10's RC branches. If this
+          # returns 0 the query is broken, and every v11 zero above is a broken
+          # grep rather than a real absence.
+          ctl=0
+          for repo in $BRANCH_REPOS; do
+            n=$(curl -sS -f -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${repo}/git/matching-refs/heads/release/10" \
+              | jq '[.[] | select(.ref | test("-rc"))] | length')
+            ctl=$(( ctl + n ))
+          done
+          echo "control (dotnet 10 rc branches found): ${ctl}"
+          if [ "$ctl" -lt 1 ]; then
+            echo "::error::control failed - the branch query found no 10.x RC branch, so it cannot be trusted to find an 11.x one."
+            exit 1
+          fi
+
+          # grep -E, the same engine the self-test asserts with. awk's regex
+          # silently downgrades \. to "any char", so it would be a looser matcher
+          # than the one proven above.
+          : > hits.txt
+          while read -r repo ref; do
+            [ -n "${ref:-}" ] || continue
+            printf '%s' "$ref" | grep -Eq "$BRANCH_RE" && echo "$repo $ref" >> hits.txt || true
+          done < refs.txt
+
+          new=""
+          touch state/branch-seen.txt
+          while read -r line; do
+            [ -n "$line" ] || continue
+            grep -Fxq "$line" state/branch-seen.txt || new="${new}${line}"$'\n'
+          done < hits.txt
+
+          if [ -n "$new" ]; then
+            echo "NEW BRANCH SIGHTING:"; printf '%s' "$new"
+            printf '%s' "$new" >> state/branch-seen.txt
+            {
+              echo "new_branches<<EOF"
+              printf '%s' "$new"
+              echo "EOF"
+              echo "has_new=true"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            echo "no new branch matching ${BRANCH_RE}"
+          fi
+
+      - name: Push early-warning alert
+        if: steps.branches.outputs.has_new == 'true'
+        env:
+          NEW: ${{ steps.branches.outputs.new_branches }}
+        run: |
+          set -euo pipefail
+          body=$(printf '%s\n' \
+            "A .NET 11 release branch appeared:" \
+            "${NEW}" \
+            "RC1 looks imminent." \
+            "" \
+            "This is NOT the go signal. Do NOT submit yet." \
+            "Only a published v11 rc release on dotnet/core authorises submission;" \
+            "that one arrives as 'RC IS LIVE' at urgent priority.")
+
+          resp=$(curl -sS -f \
+            -H "Title: EARLY WARNING - .NET 11 branch cut" \
+            -H "Priority: high" -H "Tags: construction" \
+            -H "Click: https://github.com/dotnet/aspnetcore/branches/all?query=release%2F11" \
+            -d "${body}" "https://ntfy.sh/${NTFY_TOPIC}")
+          id=$(printf '%s' "$resp" | jq -r '.id // empty')
+          [ -n "$id" ] || { echo "::error::ntfy returned no message id - push NOT stored."; exit 1; }
+          echo "early warning published, message id ${id}"
+
+      # ------------------------------------------------------------------
+      # persist state (both tiers) in one commit
+      # ------------------------------------------------------------------
+      - name: Persist state
+        if: steps.decide.outputs.first_time == 'true' || steps.branches.outputs.has_new == 'true'
+        run: |
+          set -euo pipefail
           git config user.name  "rc-watch"
           git config user.email "rc-watch@users.noreply.github.com"
-          git add state/rc-seen.json
-          git commit -m "rc-watch: first detection of ${TAG}"
+          git add state/
+          git diff --cached --quiet || git commit -m "rc-watch: state update [skip ci]"
           git push
 
+      # ------------------------------------------------------------------
+      # TIER 3 + TIER 0
+      # ------------------------------------------------------------------
       - name: Heartbeat
         if: github.event.schedule == '23 7 * * *' || github.event.inputs.heartbeat == 'true'
         env:
@@ -213,26 +346,20 @@ jobs:
           if [ "$MATCHED" = "true" ]; then
             msg="RC IS LIVE (${TAG}) - already alerted. Watcher healthy."
           else
-            msg="Still watching dotnet/core for v11.0.0-rc*. No RC yet. Watcher healthy."
+            nb=$(wc -l < state/branch-seen.txt 2>/dev/null || echo 0)
+            msg="Still watching. No v11 RC release, ${nb} v11 release-branch sighting(s). Watcher healthy."
           fi
-          curl -sS -f \
-            -H "Title: rc-watch heartbeat" \
-            -H "Priority: min" \
-            -H "Tags: eyes" \
-            -d "${msg}" \
-            "https://ntfy.sh/${NTFY_TOPIC}" > /dev/null
+          curl -sS -f -H "Title: rc-watch heartbeat" -H "Priority: min" -H "Tags: eyes" \
+            -d "${msg}" "https://ntfy.sh/${NTFY_TOPIC}" > /dev/null
           echo "heartbeat sent"
 
       - name: Report own failure
         if: failure()
         run: |
           set -euo pipefail
-          # a silent broken watcher is the exact failure this ticket exists to prevent.
+          # a silently broken watcher is the exact failure this ticket exists to prevent.
           [ -n "${NTFY_TOPIC:-}" ] || exit 0
-          curl -sS \
-            -H "Title: rc-watch FAULT" \
-            -H "Priority: high" \
-            -H "Tags: warning" \
+          curl -sS -H "Title: rc-watch FAULT" -H "Priority: high" -H "Tags: warning" \
             -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            -d "The RC watcher run failed. It is NOT watching. Check the Actions log." \
+            -d "The RC watcher run FAILED. It is not watching. Check the Actions log." \
             "https://ntfy.sh/${NTFY_TOPIC}" > /dev/null || true
