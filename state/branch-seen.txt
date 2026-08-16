@@ -1,1 +1,2 @@
 dotnet/aspnetcore refs/heads/release/11.0
+dotnet/aspnetcore refs/heads/release/11.0-rc1
